@@ -4,8 +4,9 @@
 
 class SkyModule : public Module {
 public:
-    SkyModule() : Module("BlockOfSky", "Renders the sky on Block of Sky blocks") {}
+    SkyModule() : Module("BlockOfSky", "Shows the real sky through Block of Sky") {}
 
     void onInit() override;
-    void onFrame() override;
+    void onEnable() override;
+    void onDisable() override;
 };
