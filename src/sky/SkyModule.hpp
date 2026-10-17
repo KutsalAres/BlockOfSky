@@ -7,4 +7,5 @@ public:
     SkyModule() : Module("BlockOfSky", "Renders the sky on Block of Sky blocks") {}
 
     void onInit() override;
+    void onFrame() override;
 };
