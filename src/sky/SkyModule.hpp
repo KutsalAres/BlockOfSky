@@ -6,5 +6,5 @@ class SkyModule : public Module {
 public:
     SkyModule() : Module("BlockOfSky", "Renders the sky on Block of Sky blocks") {}
 
-    void onInit() override { setMasterEnabled(true); }
+    void onInit() override;
 };
