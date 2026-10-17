@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <cstring>
 #include <dlfcn.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -38,6 +40,19 @@ constexpr std::array<std::uint8_t, 16> kVertexBytes = {
 
 std::filesystem::path g_dir;
 std::uintptr_t g_base = 0;
+
+// Bellek okunabilir mi? (mincore haritalanmamis sayfada hata doner, segfault vermez)
+bool isReadable(std::uintptr_t addr, std::size_t len) {
+    const std::uintptr_t untagged = addr & 0x00FFFFFFFFFFFFFFull;
+    if (untagged < 0x10000) return false;
+    const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+    const auto start = untagged & ~(page - 1);
+    const auto end = (untagged + len + page - 1) & ~(page - 1);
+    const std::size_t pages = (end - start) / page;
+    if (pages == 0 || pages > 4) return false;
+    unsigned char vec[4];
+    return mincore(reinterpret_cast<void*>(start), end - start, vec) == 0;
+}
 
 // ------------------------------------------------- sky blok konumlari
 
@@ -125,38 +140,57 @@ void installFaceHooks() {
 
 // ------------------------------------------- RenderLevel (sadece gozlem)
 
-using RenderLevelFn = void (*)(void*, void*, void*);
+// Tum tamsayi/float register'lari aynen iletilir; imza farkli olsa bile arguman kaybolmaz.
+using RenderLevelFn = void* (*)(void*, void*, void*, void*, void*, void*, void*, void*,
+                                float, float, float, float);
 
 RenderLevelFn g_renderLevelOriginal = nullptr;
 bedrocktools::hooks::Handle g_renderLevelHandle = nullptr;
 std::atomic<std::uint32_t> g_renderCalls{0};
 
 struct RenderSnapshot {
+    std::uintptr_t arg0 = 0, arg1 = 0, arg2 = 0;
     std::uintptr_t tessellator = 0;
     std::uintptr_t levelRendererPlayer = 0;
     float cam[3] = {0, 0, 0};
+    bool valid = false;
 };
 RenderSnapshot g_snapshot;
 
-void renderLevelDetour(void* self, void* screenContext, void* a3) {
-    if (g_renderLevelOriginal) g_renderLevelOriginal(self, screenContext, a3);
+void* renderLevelDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6,
+                        void* a7, float f0, float f1, float f2, float f3) {
+    void* result = g_renderLevelOriginal
+                       ? g_renderLevelOriginal(a0, a1, a2, a3, a4, a5, a6, a7, f0, f1, f2, f3)
+                       : nullptr;
 
     const auto n = g_renderCalls.fetch_add(1, std::memory_order_relaxed);
-    if (n % 120 != 0 || !self || !screenContext) return;
+    if (n % 120 != 0) return result;
 
     RenderSnapshot snap;
-    snap.tessellator = *reinterpret_cast<std::uintptr_t*>(
-        reinterpret_cast<std::uintptr_t>(screenContext) + offsets::ScreenContext::mTessellator);
-    snap.levelRendererPlayer = *reinterpret_cast<std::uintptr_t*>(
-        reinterpret_cast<std::uintptr_t>(self) + offsets::LevelRenderer::mLevelRendererPlayer);
-    if (snap.levelRendererPlayer >= 0x1000) {
-        const auto* cam = reinterpret_cast<const float*>(
-            snap.levelRendererPlayer + offsets::LevelRendererPlayer::mCamPos);
-        snap.cam[0] = cam[0];
-        snap.cam[1] = cam[1];
-        snap.cam[2] = cam[2];
+    snap.arg0 = reinterpret_cast<std::uintptr_t>(a0);
+    snap.arg1 = reinterpret_cast<std::uintptr_t>(a1);
+    snap.arg2 = reinterpret_cast<std::uintptr_t>(a2);
+
+    const auto self = snap.arg0;
+    const auto screenContext = snap.arg1;
+
+    const auto tessAddr = screenContext + offsets::ScreenContext::mTessellator;
+    if (isReadable(tessAddr, 8)) snap.tessellator = *reinterpret_cast<const std::uintptr_t*>(tessAddr);
+
+    const auto lrpAddr = self + offsets::LevelRenderer::mLevelRendererPlayer;
+    if (isReadable(lrpAddr, 8)) {
+        snap.levelRendererPlayer = *reinterpret_cast<const std::uintptr_t*>(lrpAddr);
+        const auto camAddr = snap.levelRendererPlayer + offsets::LevelRendererPlayer::mCamPos;
+        if (isReadable(camAddr, 12)) {
+            const auto* cam = reinterpret_cast<const float*>(camAddr);
+            snap.cam[0] = cam[0];
+            snap.cam[1] = cam[1];
+            snap.cam[2] = cam[2];
+            snap.valid = true;
+        }
     }
     g_snapshot = snap;
+    return result;
 }
 
 void installRenderLevelHook() {
@@ -187,9 +221,11 @@ void writeReport() {
         << " calls=" << g_renderCalls.load() << "\n";
 
     const auto snap = g_snapshot;
-    out << "screenContext tessellator: 0x" << std::hex << snap.tessellator << "\n"
+    out << "args: 0x" << std::hex << snap.arg0 << " 0x" << snap.arg1 << " 0x" << snap.arg2 << "\n"
+        << "screenContext tessellator: 0x" << snap.tessellator << "\n"
         << "levelRendererPlayer:       0x" << snap.levelRendererPlayer << std::dec << "\n"
-        << "camPos: " << snap.cam[0] << ", " << snap.cam[1] << ", " << snap.cam[2] << "\n";
+        << "camPos: " << snap.cam[0] << ", " << snap.cam[1] << ", " << snap.cam[2]
+        << (snap.valid ? "" : "  (not read)") << "\n";
 
     std::lock_guard lock(g_posMutex);
     out << "sky blocks seen: " << g_skyPositions.size() << "\n";
@@ -221,7 +257,7 @@ void SkyModule::onInit() {
 void SkyModule::onFrame() {
     static unsigned frame = 0;
     ++frame;
-    if (frame == 900 || frame % 1800 == 0) writeReport();
+    if (frame % 600 == 0) writeReport();
 }
 
 void SkyModule::onEnable() { g_active.store(true, std::memory_order_relaxed); }
