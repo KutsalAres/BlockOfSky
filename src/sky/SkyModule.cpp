@@ -85,60 +85,79 @@ void installFaceHooks() {
 
 // ------------------------------------------------- vertex function scanner
 
-// Yuz fonksiyonlarinin makine kodundaki BL (cagri) hedeflerini sayar.
-// Her yuzde birkac kez cagrilan ortak fonksiyonlar Tessellator::vertex / tex adayidir.
 void scanFaceFunctions() {
     const auto dir = std::filesystem::path(
         bedrocktools::config::ConfigManager::get().getConfigPath()).parent_path();
-    std::ofstream out(dir / "sky_scan.txt");
+    std::ofstream out(dir / "sky_scan2.txt");
     if (!out) return;
 
-    const auto firstFace = bedrocktools::memory::resolve(kFaceIds[1]);
+    const auto begin = bedrocktools::memory::resolve(SignatureId::TessellatorBegin);
     Dl_info info{};
-    if (!firstFace || !dladdr(reinterpret_cast<void*>(firstFace), &info) || !info.dli_fbase) {
+    if (!begin || !dladdr(reinterpret_cast<void*>(begin), &info) || !info.dli_fbase) {
         out << "base not found\n";
         return;
     }
     const auto base = reinterpret_cast<std::uintptr_t>(info.dli_fbase);
+    const std::uintptr_t lo = begin - 0x4000;
+    const std::uintptr_t hi = begin + 0x4000;
 
+    auto dumpBytes = [&](std::uintptr_t addr, int n) {
+        char buf[8];
+        const auto* b = reinterpret_cast<const std::uint8_t*>(addr);
+        for (int i = 0; i < n; ++i) {
+            std::snprintf(buf, sizeof buf, " %02X", b[i]);
+            out << buf;
+        }
+    };
+
+    // A) yuz fonksiyonlarinin Tessellator bolgesindeki cagri hedefleri
     std::map<std::uintptr_t, std::array<int, kFaceCount>> targets;
     for (std::size_t f = 0; f < kFaceCount; ++f) {
         const auto start = bedrocktools::memory::resolve(kFaceIds[f]);
         if (!start) continue;
         const auto* code = reinterpret_cast<const std::uint32_t*>(start);
-        for (int k = 0; k < 400; ++k) {
+        for (int k = 0; k < 1200; ++k) {
             const std::uint32_t ins = code[k];
             if ((ins & 0xFC000000u) != 0x94000000u) continue;  // BL
             const std::int32_t imm = static_cast<std::int32_t>(ins << 6) >> 6;
             const auto target = start + static_cast<std::intptr_t>(k) * 4 +
                                 static_cast<std::intptr_t>(imm) * 4;
-            ++targets[target][f];
+            if (target >= lo && target < hi) ++targets[target][f];
         }
     }
 
-    const auto begin = bedrocktools::memory::resolve(SignatureId::TessellatorBegin);
-    const auto color = bedrocktools::memory::resolve(SignatureId::TessellatorColor);
-    out << "known: TessellatorBegin=0x" << std::hex << (begin ? begin - base : 0)
-        << " TessellatorColor=0x" << (color ? color - base : 0) << std::dec << "\n";
-
-    char buf[8];
+    out << "== A: face callees in tessellator region\n";
     for (const auto& [target, counts] : targets) {
-        int facesHit = 0, total = 0;
-        for (int c : counts) {
-            if (c > 0) ++facesHit;
-            total += c;
-        }
-        if (facesHit < 3 || total < 6) continue;
-
-        out << "0x" << std::hex << (target - base) << std::dec << "  counts:";
+        out << "0x" << std::hex << (target - base) << std::dec << " counts:";
         for (int c : counts) out << ' ' << c;
-        out << "  bytes:";
-        const auto* bytes = reinterpret_cast<const std::uint8_t*>(target);
-        for (int i = 0; i < 48; ++i) {
-            std::snprintf(buf, sizeof buf, " %02X", bytes[i]);
-            out << buf;
-        }
+        out << " bytes:";
+        dumpBytes(target, 32);
         out << "\n";
+    }
+
+    // B) basinda TLS (TPIDR_EL0) okuyan fonksiyonlar
+    out << "== B: prologue reads TPIDR_EL0\n";
+    int lines = 0;
+    for (std::uintptr_t a = lo; a < hi && lines < 80; a += 4) {
+        const auto ins = *reinterpret_cast<const std::uint32_t*>(a);
+        const bool isSub = (ins & 0xFF0003FFu) == 0xD10003FFu;  // SUB SP, SP, #imm
+        const bool isStp = (ins & 0xFFC07FFFu) == 0xA9807BFDu;  // STP X29, X30, [SP, #imm]!
+        if (!isSub && !isStp) continue;
+        for (int k = 1; k < 24; ++k) {
+            const auto n = *reinterpret_cast<const std::uint32_t*>(a + k * 4);
+            if ((n & 0xFFFFFFE0u) != 0xD53BD040u) continue;  // MRS Xt, TPIDR_EL0
+            int calls = 0;
+            const auto it = targets.find(a);
+            if (it != targets.end()) {
+                for (int c : it->second) calls += c;
+            }
+            out << "0x" << std::hex << (a - base) << std::dec << " mrs@" << k
+                << " faceCalls:" << calls << " bytes:";
+            dumpBytes(a, 64);
+            out << "\n";
+            ++lines;
+            break;
+        }
     }
 }
 
