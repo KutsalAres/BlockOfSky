@@ -3,30 +3,66 @@
 #include "config/ConfigManager.hpp"
 #include "core/memory/Hooks.hpp"
 #include <bedrocktools/memory/Signatures.hpp>
+#include <bedrocktools/sdk/Offsets.hpp>
 #include <bedrocktools/sdk/render/Block.hpp>
 
-#include <algorithm>
 #include <android/log.h>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
 
 using bedrocktools::memory::SignatureId;
+namespace offsets = bedrocktools::sdk::offsets;
 
 constexpr std::string_view kSkyBlockName = "bos:block_of_sky";
 constexpr std::size_t kFaceCount = 6;
 
+// 1.26.52.3: probe sonucuyla bulunan Tessellator::vertex(float x, float y, float z)
+constexpr std::uintptr_t kVertexOffset = 0xa76f048;
+constexpr std::array<std::uint8_t, 16> kVertexBytes = {
+    0xFF, 0xC3, 0x02, 0xD1, 0xEA, 0x1B, 0x00, 0xFD,
+    0xE9, 0x23, 0x04, 0x6D, 0xFD, 0x7B, 0x05, 0xA9};
+
 std::filesystem::path g_dir;
 std::uintptr_t g_base = 0;
+
+// ------------------------------------------------- sky blok konumlari
+
+struct SkyPos {
+    float rx, ry, rz;  // oyunun verdigi ham konum
+    int x, y, z;       // floor
+};
+
+std::mutex g_posMutex;
+std::vector<SkyPos> g_skyPositions;
+
+void recordSkyPosition(const void* pos) {
+    if (!pos) return;
+    const auto* p = static_cast<const float*>(pos);
+    SkyPos s{p[0], p[1], p[2],
+             static_cast<int>(std::floor(p[0])),
+             static_cast<int>(std::floor(p[1])),
+             static_cast<int>(std::floor(p[2]))};
+    std::lock_guard lock(g_posMutex);
+    if (g_skyPositions.size() >= 256) return;
+    for (const auto& e : g_skyPositions) {
+        if (e.x == s.x && e.y == s.y && e.z == s.z) return;
+    }
+    g_skyPositions.push_back(s);
+}
 
 // ---------------------------------------------------------------- face hooks
 
@@ -57,8 +93,10 @@ bool isSkyBlock(const void* block) {
 
 template <std::size_t Face>
 void faceDetour(void* tess, void* meshTess, const void* block, const void* pos, const void* tex) {
-    // Sky blogunun yuzleri chunk'ta cizilmez.
-    if (g_active.load(std::memory_order_relaxed) && isSkyBlock(block)) return;
+    if (g_active.load(std::memory_order_relaxed) && isSkyBlock(block)) {
+        recordSkyPosition(pos);
+        return;  // yuzler chunk'ta cizilmez
+    }
     if (g_original[Face]) g_original[Face](tess, meshTess, block, pos, tex);
 }
 
@@ -85,93 +123,81 @@ void installFaceHooks() {
     __android_log_print(ANDROID_LOG_INFO, "BlockOfSky", "face hooks: %zu/%zu", installed, kFaceCount);
 }
 
-// ------------------------------------------------- Tessellator::vertex probes
-//
-// sky_scan2.txt'deki adaylari hook'layip kac kez cagrildiklarini ve
-// ilk cagrilarin argumanlarini kaydeder. Gercek vertex fonksiyonu cok sik
-// cagrilir ve argumanlari dunya koordinatlari (ya da bir Vec3 isaretcisi) olur.
+// ------------------------------------------- RenderLevel (sadece gozlem)
 
-struct ProbeSpec {
-    std::uintptr_t offset;
-    const char* name;
+using RenderLevelFn = void (*)(void*, void*, void*);
+
+RenderLevelFn g_renderLevelOriginal = nullptr;
+bedrocktools::hooks::Handle g_renderLevelHandle = nullptr;
+std::atomic<std::uint32_t> g_renderCalls{0};
+
+struct RenderSnapshot {
+    std::uintptr_t tessellator = 0;
+    std::uintptr_t levelRendererPlayer = 0;
+    float cam[3] = {0, 0, 0};
 };
+RenderSnapshot g_snapshot;
 
-constexpr std::array<ProbeSpec, 7> kProbeSpecs = {{
-    {0xa7717f4, "cand_a7717f4 (loads 3 floats from x1)"},
-    {0xa771f84, "cand_a771f84 (TLS x24, like old signature)"},
-    {0xa76f048, "cand_a76f048"},
-    {0xa7710f8, "cand_a7710f8"},
-    {0xa76e14c, "cand_a76e14c"},
-    {0xa76deb8, "cand_a76deb8"},
-    {0xa76ef7c, "reference_a76ef7c (tex-like, 20 calls per face)"},
-}};
-constexpr std::size_t kProbeCount = kProbeSpecs.size();
-constexpr std::size_t kSampleCount = 8;
+void renderLevelDetour(void* self, void* screenContext, void* a3) {
+    if (g_renderLevelOriginal) g_renderLevelOriginal(self, screenContext, a3);
 
-using ProbeFn = void* (*)(void*, void*, void*, void*, float, float, float, float);
+    const auto n = g_renderCalls.fetch_add(1, std::memory_order_relaxed);
+    if (n % 120 != 0 || !self || !screenContext) return;
 
-struct Sample {
-    std::uintptr_t x1 = 0;
-    std::uintptr_t x2 = 0;
-    float f0 = 0, f1 = 0, f2 = 0;
-};
-
-struct ProbeState {
-    ProbeFn original = nullptr;
-    bedrocktools::hooks::Handle handle = nullptr;
-    std::atomic<std::uint32_t> calls{0};
-    std::array<Sample, kSampleCount> samples{};
-};
-
-std::array<ProbeState, kProbeCount> g_probes;
-
-template <std::size_t P>
-void* probeDetour(void* a0, void* a1, void* a2, void* a3, float f0, float f1, float f2, float f3) {
-    auto& st = g_probes[P];
-    const auto n = st.calls.fetch_add(1, std::memory_order_relaxed);
-    if (n < kSampleCount) {
-        st.samples[n] = Sample{reinterpret_cast<std::uintptr_t>(a1),
-                               reinterpret_cast<std::uintptr_t>(a2), f0, f1, f2};
+    RenderSnapshot snap;
+    snap.tessellator = *reinterpret_cast<std::uintptr_t*>(
+        reinterpret_cast<std::uintptr_t>(screenContext) + offsets::ScreenContext::mTessellator);
+    snap.levelRendererPlayer = *reinterpret_cast<std::uintptr_t*>(
+        reinterpret_cast<std::uintptr_t>(self) + offsets::LevelRenderer::mLevelRendererPlayer);
+    if (snap.levelRendererPlayer >= 0x1000) {
+        const auto* cam = reinterpret_cast<const float*>(
+            snap.levelRendererPlayer + offsets::LevelRendererPlayer::mCamPos);
+        snap.cam[0] = cam[0];
+        snap.cam[1] = cam[1];
+        snap.cam[2] = cam[2];
     }
-    return st.original ? st.original(a0, a1, a2, a3, f0, f1, f2, f3) : nullptr;
+    g_snapshot = snap;
 }
 
-template <std::size_t... I>
-constexpr std::array<ProbeFn, kProbeCount> makeProbeDetours(std::index_sequence<I...>) {
-    return {&probeDetour<I>...};
+void installRenderLevelHook() {
+    const auto address = bedrocktools::memory::resolve(SignatureId::RenderLevel);
+    if (!address) return;
+    g_renderLevelHandle = bedrocktools::hooks::install(
+        reinterpret_cast<void*>(address),
+        reinterpret_cast<void*>(&renderLevelDetour),
+        reinterpret_cast<void**>(&g_renderLevelOriginal));
+    __android_log_print(ANDROID_LOG_INFO, "BlockOfSky", "RenderLevel hook: %s",
+                        g_renderLevelHandle ? "OK" : "FAILED");
 }
 
-constexpr auto kProbeDetours = makeProbeDetours(std::make_index_sequence<kProbeCount>{});
+// ------------------------------------------------------------------ rapor
 
-void installProbes() {
-    if (!g_base) return;
-    std::size_t installed = 0;
-    for (std::size_t i = 0; i < kProbeCount; ++i) {
-        const auto address = g_base + kProbeSpecs[i].offset;
-        g_probes[i].handle = bedrocktools::hooks::install(
-            reinterpret_cast<void*>(address),
-            reinterpret_cast<void*>(kProbeDetours[i]),
-            reinterpret_cast<void**>(&g_probes[i].original));
-        if (g_probes[i].handle) ++installed;
-    }
-    __android_log_print(ANDROID_LOG_INFO, "BlockOfSky", "probes: %zu/%zu", installed, kProbeCount);
-}
-
-void writeProbeReport() {
-    std::ofstream out(g_dir / "sky_probe.txt");
+void writeReport() {
+    std::ofstream out(g_dir / "sky_render.txt");
     if (!out) return;
-    for (std::size_t i = 0; i < kProbeCount; ++i) {
-        const auto& st = g_probes[i];
-        const auto calls = st.calls.load(std::memory_order_relaxed);
-        out << "0x" << std::hex << kProbeSpecs[i].offset << std::dec << " "
-            << kProbeSpecs[i].name << " hooked=" << (st.handle ? "yes" : "NO")
-            << " calls=" << calls << "\n";
-        const auto shown = std::min<std::uint32_t>(calls, kSampleCount);
-        for (std::uint32_t s = 0; s < shown; ++s) {
-            const auto& sm = st.samples[s];
-            out << "    x1=0x" << std::hex << sm.x1 << " x2=0x" << sm.x2 << std::dec
-                << "  f=[" << sm.f0 << ", " << sm.f1 << ", " << sm.f2 << "]\n";
-        }
+
+    bool vertexOk = false;
+    if (g_base) {
+        vertexOk = std::memcmp(reinterpret_cast<const void*>(g_base + kVertexOffset),
+                               kVertexBytes.data(), kVertexBytes.size()) == 0;
+    }
+    out << "vertex bytes at base+0x" << std::hex << kVertexOffset << std::dec << ": "
+        << (vertexOk ? "MATCH" : "MISMATCH") << "\n";
+    out << "RenderLevel hook: " << (g_renderLevelHandle ? "yes" : "NO")
+        << " calls=" << g_renderCalls.load() << "\n";
+
+    const auto snap = g_snapshot;
+    out << "screenContext tessellator: 0x" << std::hex << snap.tessellator << "\n"
+        << "levelRendererPlayer:       0x" << snap.levelRendererPlayer << std::dec << "\n"
+        << "camPos: " << snap.cam[0] << ", " << snap.cam[1] << ", " << snap.cam[2] << "\n";
+
+    std::lock_guard lock(g_posMutex);
+    out << "sky blocks seen: " << g_skyPositions.size() << "\n";
+    std::size_t shown = 0;
+    for (const auto& s : g_skyPositions) {
+        if (shown++ >= 16) break;
+        out << "  raw=(" << s.rx << ", " << s.ry << ", " << s.rz << ")  floor=("
+            << s.x << ", " << s.y << ", " << s.z << ")\n";
     }
 }
 
@@ -188,14 +214,14 @@ void SkyModule::onInit() {
     }
 
     installFaceHooks();
-    installProbes();
+    installRenderLevelHook();
     setMasterEnabled(true);
 }
 
 void SkyModule::onFrame() {
     static unsigned frame = 0;
     ++frame;
-    if (frame == 600 || frame % 1800 == 0) writeProbeReport();
+    if (frame == 900 || frame % 1800 == 0) writeReport();
 }
 
 void SkyModule::onEnable() { g_active.store(true, std::memory_order_relaxed); }
