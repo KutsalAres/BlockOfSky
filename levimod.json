@@ -1,30 +1,23 @@
 {
   "schema_version": 1,
-  "id": "bedrocktools",
-  "version": "1.5.6",
+  "id": "blockofsky",
+  "version": "0.1.0",
   "minecraft_versions": [
     "1.26.5X.X"
   ],
   "info": {
-    "name": "BedrockTools",
-    "author": "MrPokeG",
-    "description": "A collection of utility, HUD, player, and visual modules for Minecraft Bedrock.",
-    "homepage_url": "https://github.com/QYCottage/BedrockTools",
+    "name": "Block of Sky",
+    "author": "KutsalAres",
+    "description": "Adds a block that always renders the sky.",
+    "homepage_url": "https://github.com/KutsalAres/BlockOfSky",
     "icon": "assets/bedrocktools.png",
-    "tags": [
-      "Utility",
-      "HUD",
-      "Visual"
-    ]
+    "tags": ["Blocks", "Visual"]
   },
   "release_assets": {
-    "include": [
-      "*.levipack",
-      "*.so"
-    ],
+    "include": ["*.levipack", "*.so"],
     "labels": {
-      "BedrockTools.levipack": "LeviPack",
-      "libBedrockTools.so": "Native library"
+      "BlockOfSky.levipack": "LeviPack",
+      "libBlockOfSky.so": "Native library"
     }
   }
 }
