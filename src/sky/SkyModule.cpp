@@ -95,8 +95,12 @@ void loadStages() {
     writeStageFile("");
 }
 
-bool stageAllowed(const char* name) { return g_failedStages.count(name) == 0; }
-void armStage(const char* name) { writeStageFile(name); }
+// Yeni derlemede eski basarisizliklar gecersiz olsun diye adimlar derleme etiketiyle saklanir.
+constexpr const char* kBuildTag = "r3:";
+std::string tagged(const char* name) { return std::string(kBuildTag) + name; }
+
+bool stageAllowed(const char* name) { return g_failedStages.count(tagged(name)) == 0; }
+void armStage(const char* name) { writeStageFile(tagged(name)); }
 void disarmStage() { writeStageFile(""); }
 
 // ------------------------------------------------- ayarlar (sky_params.txt)
@@ -424,7 +428,7 @@ void acquireMaterial() {
         return;
     }
     using GetMaterialFn = MaterialPtr (*)(void*, const HashedString*);
-    static const char* kNames[] = {"selection_overlay", "selection_box"};
+    static const char* kNames[] = {"selection_box", "selection_overlay"};
     for (const char* name : kNames) {
         HashedString hs(name);
         MaterialPtr m = reinterpret_cast<GetMaterialFn>(fn)(reinterpret_cast<void*>(group), &hs);
@@ -448,10 +452,12 @@ using RenderMeshFn = void (*)(void*, void*, void*, char*);
 TessBeginFn g_tessBegin = nullptr;
 TessColorFn g_tessColor = nullptr;
 TessVertexFn g_tessVertex = nullptr;
-RenderMeshFn g_renderMesh = nullptr;
+std::array<RenderMeshFn, 2> g_renderMeshes{};
+constexpr const char* kRenderStages[2] = {"draw:render:0", "draw:render:1"};
 
 std::atomic<std::uint32_t> g_drawFrames{0};
 std::atomic<std::uint32_t> g_lastQuadCount{0};
+std::atomic<int> g_renderIdxUsed{-1};
 std::atomic<int> g_drawState{0};  // 0=hazir degil 1=cizdi 2=atlandi
 std::string g_drawNote;
 std::mutex g_noteMutex;
@@ -469,9 +475,10 @@ void resolveDrawFunctions() {
                     kVertexBytes.size()) == 0) {
         g_tessVertex = reinterpret_cast<TessVertexFn>(g_base + kVertexOffset);
     }
-    auto rm = bedrocktools::memory::resolve(SignatureId::MeshHelpersRenderMeshImmediately2);
-    if (!rm) rm = bedrocktools::memory::resolve(SignatureId::MeshHelpersRenderMeshImmediately);
-    g_renderMesh = reinterpret_cast<RenderMeshFn>(rm);
+    g_renderMeshes[0] = reinterpret_cast<RenderMeshFn>(
+        bedrocktools::memory::resolve(SignatureId::MeshHelpersRenderMeshImmediately2));
+    g_renderMeshes[1] = reinterpret_cast<RenderMeshFn>(
+        bedrocktools::memory::resolve(SignatureId::MeshHelpersRenderMeshImmediately));
 }
 
 // Her yuz 4 kose: 0 -> -eps, 1 -> 1+eps. Iki sarim yonu da cizilir (culling bilinmiyor).
@@ -484,15 +491,24 @@ constexpr int kFaceCorners[6][4][3] = {
     {{1, 0, 0}, {1, 1, 0}, {1, 1, 1}, {1, 0, 1}},  // dogu
 };
 
-bool drawSkyBlocks(void* screenContext, void* tess, const Vec3f& cam) {
+bool drawSkyBlocks(void* screenContext, void* tess, const Vec3f& cam, bool first, int renderIdx) {
     const auto blocks = copySkyPositions();
     if (blocks.empty()) return false;
 
     constexpr float kEps = 0.003f;
     const float maxDist2 = g_params.maxDist * g_params.maxDist;
 
+    if (first) armStage("draw:begin");
     g_tessBegin(tess, nullptr, 1 /*QuadList*/, 0, 0);
+    if (first) {
+        disarmStage();
+        armStage("draw:color");
+    }
     g_tessColor(tess, g_params.r, g_params.g, g_params.b, 1.0f);
+    if (first) {
+        disarmStage();
+        armStage("draw:vertex");
+    }
 
     std::uint32_t quads = 0;
     for (const auto& b : blocks) {
@@ -514,10 +530,16 @@ bool drawSkyBlocks(void* screenContext, void* tess, const Vec3f& cam) {
         }
     }
 
+    if (first) {
+        disarmStage();
+        armStage(kRenderStages[renderIdx]);
+    }
     char pad[0x58];
     std::memset(pad, 0, sizeof(pad));
-    g_renderMesh(screenContext, tess, &g_material, pad);
+    g_renderMeshes[renderIdx](screenContext, tess, &g_material, pad);
+    if (first) disarmStage();
     g_lastQuadCount.store(quads, std::memory_order_relaxed);
+    g_renderIdxUsed.store(renderIdx, std::memory_order_relaxed);
     return true;
 }
 
@@ -526,16 +548,27 @@ void tryDraw(void* screenContext) {
         setNote("draw=0 in sky_params.txt");
         return;
     }
-    if (!stageAllowed("draw")) {
-        setNote("skipped (crashed last time)");
-        g_drawState.store(2);
+    if (!stageAllowed("draw:begin") || !stageAllowed("draw:color") || !stageAllowed("draw:vertex")) {
+        setNote("disabled: begin/color/vertex crashed before (see failed stages)");
+        return;
+    }
+    int renderIdx = -1;
+    for (int i = 0; i < 2; ++i) {
+        if (g_renderMeshes[i] && stageAllowed(kRenderStages[i])) {
+            renderIdx = i;
+            break;
+        }
+    }
+    if (renderIdx < 0) {
+        setNote("disabled: no usable renderMesh (missing or crashed before)");
         return;
     }
     const auto tess = g_renderTess.load();
     if (!tess) return setNote("waiting: tessellator not captured yet");
-    if (!g_tessBegin || !g_tessColor || !g_tessVertex || !g_renderMesh)
-        return setNote("missing draw functions (begin/color/vertex/renderMesh)");
+    if (!g_tessBegin || !g_tessColor || !g_tessVertex)
+        return setNote("missing draw functions (begin/color/vertex)");
     if (!g_material) return setNote("waiting: no material");
+    if (!isReadable(tess, 0x100)) return setNote("tessellator not readable");
     if (!isReadable(reinterpret_cast<std::uintptr_t>(screenContext), 0x40))
         return setNote("screenContext not readable");
 
@@ -544,14 +577,8 @@ void tryDraw(void* screenContext) {
     const Vec3f cam{pos.x, pos.y + g_params.eye, pos.z};
 
     const bool first = g_drawState.load() == 0;
-    if (first) armStage("draw");
-    const bool drew = drawSkyBlocks(screenContext, reinterpret_cast<void*>(tess), cam);
-    if (first && drew) {
-        disarmStage();
-        g_drawState.store(1);
-    } else if (first) {
-        disarmStage();  // cizilecek blok yoktu, riskli cagri yapilmadi
-    }
+    const bool drew = drawSkyBlocks(screenContext, reinterpret_cast<void*>(tess), cam, first, renderIdx);
+    if (first && drew) g_drawState.store(1);
     if (drew) g_drawFrames.fetch_add(1, std::memory_order_relaxed);
     setNote(drew ? "drawing" : "no sky blocks in range");
 }
@@ -606,7 +633,9 @@ void writeReport() {
         << " calls=" << g_renderCalls.load() << "\n";
     out << "vertex fn: " << (g_tessVertex ? "ok" : "MISSING") << ", begin: " << (g_tessBegin ? "ok" : "MISSING")
         << ", color: " << (g_tessColor ? "ok" : "MISSING")
-        << ", renderMesh: " << (g_renderMesh ? "ok" : "MISSING") << "\n";
+        << ", renderMesh[0]: " << (g_renderMeshes[0] ? "ok" : "MISSING")
+        << ", renderMesh[1]: " << (g_renderMeshes[1] ? "ok" : "MISSING")
+        << ", used: " << g_renderIdxUsed.load() << "\n";
     out << "tessellator (captured in RenderLevel): 0x" << std::hex << g_renderTess.load() << std::dec << "\n";
     out << "RenderLevel args: 0x" << std::hex << g_arg0.load() << " 0x" << g_arg1.load() << std::dec << "\n";
     out << "material: " << g_materialName << (g_material ? " (acquired)" : "") << "\n";
