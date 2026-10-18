@@ -2,6 +2,8 @@
 
 #include "config/ConfigManager.hpp"
 #include "core/memory/Hooks.hpp"
+#include <bedrocktools/events/EventBus.hpp>
+#include <bedrocktools/events/Events.hpp>
 #include <bedrocktools/memory/Signatures.hpp>
 #include <bedrocktools/sdk/Offsets.hpp>
 #include <bedrocktools/sdk/render/Block.hpp>
@@ -20,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -42,6 +45,10 @@ constexpr std::array<std::uint8_t, 16> kVertexBytes = {
 std::filesystem::path g_dir;
 std::uintptr_t g_base = 0;
 
+struct Vec3f {
+    float x = 0, y = 0, z = 0;
+};
+
 // Bellek okunabilir mi? (mincore haritalanmamis sayfada hata doner, segfault vermez)
 bool isReadable(std::uintptr_t addr, std::size_t len) {
     const std::uintptr_t untagged = addr & 0x00FFFFFFFFFFFFFFull;
@@ -53,6 +60,75 @@ bool isReadable(std::uintptr_t addr, std::size_t len) {
     if (pages == 0 || pages > 4) return false;
     unsigned char vec[4];
     return mincore(reinterpret_cast<void*>(start), end - start, vec) == 0;
+}
+
+// ------------------------------------------- riskli adimlar icin asama isareti
+//
+// Riskli bir adimdan once sky_stage.txt'e adim adi yazilir. Oyun cokerse bir
+// sonraki acilista bu adim "basarisiz" sayilir ve bir daha denenmez.
+
+std::set<std::string> g_failedStages;
+
+void writeStageFile(const std::string& text) {
+    std::ofstream out(g_dir / "sky_stage.txt", std::ios::trunc);
+    out << text;
+}
+
+void loadStages() {
+    {
+        std::ifstream in(g_dir / "sky_failed.txt");
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty()) g_failedStages.insert(line);
+        }
+    }
+    std::string armed;
+    {
+        std::ifstream in(g_dir / "sky_stage.txt");
+        std::getline(in, armed);
+    }
+    if (!armed.empty()) {
+        g_failedStages.insert(armed);
+        std::ofstream out(g_dir / "sky_failed.txt", std::ios::app);
+        out << armed << "\n";
+    }
+    writeStageFile("");
+}
+
+bool stageAllowed(const char* name) { return g_failedStages.count(name) == 0; }
+void armStage(const char* name) { writeStageFile(name); }
+void disarmStage() { writeStageFile(""); }
+
+// ------------------------------------------------- ayarlar (sky_params.txt)
+
+struct Params {
+    float eye = 1.62f;     // oyuncu konumuna eklenen goz yuksekligi
+    bool draw = true;      // cizimi ac/kapat
+    float r = 0.45f, g = 0.70f, b = 1.0f;
+    float maxDist = 64.f;
+};
+Params g_params;
+
+void loadParams() {
+    const auto path = g_dir / "sky_params.txt";
+    std::ifstream in(path);
+    if (!in) {
+        std::ofstream out(path);
+        out << "eye 1.62\ndraw 1\nr 0.45\ng 0.70\nb 1.0\nmaxdist 64\n";
+        return;
+    }
+    Params p;
+    std::string key;
+    float v = 0;
+    while (in >> key >> v) {
+        if (key == "eye") p.eye = v;
+        else if (key == "draw") p.draw = v != 0.f;
+        else if (key == "r") p.r = v;
+        else if (key == "g") p.g = v;
+        else if (key == "b") p.b = v;
+        else if (key == "maxdist") p.maxDist = v;
+    }
+    g_params = p;
 }
 
 // ------------------------------------------------- sky blok konumlari
@@ -78,6 +154,11 @@ void recordSkyPosition(const void* pos) {
         if (e.x == s.x && e.y == s.y && e.z == s.z) return;
     }
     g_skyPositions.push_back(s);
+}
+
+std::vector<SkyPos> copySkyPositions() {
+    std::lock_guard lock(g_posMutex);
+    return g_skyPositions;
 }
 
 // ---------------------------------------------------------------- face hooks
@@ -139,28 +220,19 @@ void installFaceHooks() {
     __android_log_print(ANDROID_LOG_INFO, "BlockOfSky", "face hooks: %zu/%zu", installed, kFaceCount);
 }
 
-// ------------------------------- Tessellator::begin (RenderLevel icindeki tessellator)
+// ------------------------- Tessellator::begin: RenderLevel icindeki tessellator'i yakala
 
 using BeginFn = void* (*)(void*, void*, void*, void*, void*, void*, void*, void*);
 
 BeginFn g_beginOriginal = nullptr;
 bedrocktools::hooks::Handle g_beginHandle = nullptr;
 thread_local bool t_inRenderLevel = false;
-std::array<std::atomic<std::uintptr_t>, 16> g_renderTess{};
-
-void noteRenderTessellator(std::uintptr_t p) {
-    for (auto& slot : g_renderTess) {
-        const auto cur = slot.load(std::memory_order_relaxed);
-        if (cur == p) return;
-        if (cur == 0) {
-            std::uintptr_t expected = 0;
-            if (slot.compare_exchange_strong(expected, p) || expected == p) return;
-        }
-    }
-}
+std::atomic<std::uintptr_t> g_renderTess{0};
 
 void* beginDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7) {
-    if (t_inRenderLevel) noteRenderTessellator(reinterpret_cast<std::uintptr_t>(a0));
+    if (t_inRenderLevel && g_renderTess.load(std::memory_order_relaxed) == 0) {
+        g_renderTess.store(reinterpret_cast<std::uintptr_t>(a0), std::memory_order_relaxed);
+    }
     return g_beginOriginal ? g_beginOriginal(a0, a1, a2, a3, a4, a5, a6, a7) : nullptr;
 }
 
@@ -173,106 +245,318 @@ void installBeginHook() {
         reinterpret_cast<void**>(&g_beginOriginal));
 }
 
-// ------------------------------------------------ ofset kesfi (sadece okuma)
+// ------------------------------------------------------- oyuncu konumu
 
-std::mutex g_scanMutex;
-std::string g_scanText;
-int g_scanRuns = 0;
+std::atomic<std::uintptr_t> g_player{0};
 
-std::vector<SkyPos> copySkyPositions() {
-    std::lock_guard lock(g_posMutex);
-    return g_skyPositions;
+void installPlayerTracking() {
+    bedrocktools::events::bus().subscribe<bedrocktools::events::LocalPlayerTickEvent>(
+        [](bedrocktools::events::LocalPlayerTickEvent& e) {
+            g_player.store(reinterpret_cast<std::uintptr_t>(e.player), std::memory_order_relaxed);
+        });
 }
 
-bool nearSkyBlock(const float* f, const std::vector<SkyPos>& blocks) {
+bool readPlayerPosition(Vec3f& out) {
+    const auto player = g_player.load(std::memory_order_relaxed);
+    if (!player || !isReadable(player + offsets::Actor::mStateVectorComponent, 8)) return false;
+    const auto svc = *reinterpret_cast<const std::uintptr_t*>(player + offsets::Actor::mStateVectorComponent);
+    if (!isReadable(svc, 12)) return false;
+    const auto* p = reinterpret_cast<const float*>(svc);
+    for (int i = 0; i < 3; ++i) {
+        if (!std::isfinite(p[i]) || std::fabs(p[i]) > 1.0e6f) return false;
+    }
+    out = {p[0], p[1], p[2]};
+    return true;
+}
+
+// Oyuncu konumu eski ofsetten okunamazsa: oyuncu nesnesinde sky bloklarina yakin 3'lu float ara.
+bool looksLikePosition(const float* f, const std::vector<SkyPos>& blocks) {
     for (int i = 0; i < 3; ++i) {
         if (!std::isfinite(f[i]) || std::fabs(f[i]) > 30000.f) return false;
     }
-    if (f[0] == 0.f && f[1] == 0.f && f[2] == 0.f) return false;
+    if (std::fabs(f[0]) < 0.05f && std::fabs(f[2]) < 0.05f) return false;
     for (const auto& b : blocks) {
-        if (std::fabs(f[0] - static_cast<float>(b.x)) < 24.f &&
-            std::fabs(f[1] - static_cast<float>(b.y)) < 24.f &&
-            std::fabs(f[2] - static_cast<float>(b.z)) < 24.f) {
+        if (std::fabs(f[1] - static_cast<float>(b.y)) < 10.f &&
+            std::fabs(f[0] - static_cast<float>(b.x)) < 30.f &&
+            std::fabs(f[2] - static_cast<float>(b.z)) < 30.f) {
             return true;
         }
     }
     return false;
 }
 
-// [region, region+size) icinde sky bloklarina yakin 3'lu float ara (kamera konumu adayi)
-void scanRegion(std::uintptr_t region, std::size_t size, const char* label, std::uintptr_t via,
-                const std::vector<SkyPos>& blocks, std::string& text, int& found) {
-    if (found >= 40 || !isReadable(region, size)) return;
-    for (std::size_t off = 0; off + 12 <= size && found < 40; off += 4) {
-        const auto* f = reinterpret_cast<const float*>(region + off);
-        if (!nearSkyBlock(f, blocks)) continue;
-        char line[160];
-        std::snprintf(line, sizeof line, "  cam candidate %s+0x%zx -> +0x%zx: (%.2f, %.2f, %.2f)\n",
-                      label, static_cast<std::size_t>(via), off, f[0], f[1], f[2]);
-        text += line;
-        ++found;
+std::string scanPlayerForPosition() {
+    std::string text;
+    const auto player = g_player.load();
+    const auto blocks = copySkyPositions();
+    if (!player || blocks.empty() || !isReadable(player, 0x800)) return "  (player scan skipped)\n";
+    int found = 0;
+    auto scan = [&](std::uintptr_t region, std::size_t size, std::uintptr_t via) {
+        if (!isReadable(region, size)) return;
+        int local = 0;
+        for (std::size_t off = 0; off + 12 <= size && found < 20 && local < 2; off += 4) {
+            const auto* f = reinterpret_cast<const float*>(region + off);
+            if (!looksLikePosition(f, blocks)) continue;
+            char line[160];
+            std::snprintf(line, sizeof line, "  pos? player+0x%zx -> +0x%zx: (%.2f, %.2f, %.2f)\n",
+                          static_cast<std::size_t>(via), off, f[0], f[1], f[2]);
+            text += line;
+            ++found;
+            ++local;
+        }
+    };
+    scan(player, 0x800, 0);
+    for (std::size_t off = 0; off < 0x800 && found < 20; off += 8) {
+        const auto ptr = *reinterpret_cast<const std::uintptr_t*>(player + off);
+        if ((ptr & 0x00FFFFFFFFFFFFFFull) < 0x10000 || ptr == player) continue;
+        scan(ptr, 0x400, off);
     }
+    if (found == 0) text += "  (no position candidates)\n";
+    return text;
 }
 
-void scanForCamera(std::uintptr_t root, const char* label, const std::vector<SkyPos>& blocks,
-                   std::string& text, int& found) {
-    if (!isReadable(root, 0x800)) return;
-    scanRegion(root, 0x800, label, 0, blocks, text, found);  // dogrudan
-    for (std::size_t off = 0; off < 0x800 && found < 40; off += 8) {
-        const auto ptr = *reinterpret_cast<const std::uintptr_t*>(root + off);
-        if ((ptr & 0x00FFFFFFFFFFFFFFull) < 0x10000 || ptr == root) continue;
-        scanRegion(ptr, 0x1000, label, off, blocks, text, found);  // 1 seviye isaretci
-    }
-}
+// ---------------------------------------------------------------- materyal
 
-void markTessellatorOffsets(std::uintptr_t root, const char* label,
-                            const std::array<std::uintptr_t, 16>& tess, std::string& text) {
-    if (!isReadable(root, 0x400)) return;
-    for (std::size_t off = 0; off < 0x400; off += 8) {
-        const auto word = *reinterpret_cast<const std::uintptr_t*>(root + off);
-        if (word == 0) continue;
-        for (const auto t : tess) {
-            if (t != 0 && word == t) {
-                char line[160];
-                std::snprintf(line, sizeof line,
-                              "  %s+0x%zx == tessellator used inside RenderLevel (0x%llx)\n", label,
-                              off, static_cast<unsigned long long>(t));
-                text += line;
+struct HashedString {
+    std::uint64_t mStrHash;
+    std::string mStr;
+    mutable const HashedString* mLastMatch;
+
+    explicit HashedString(const char* str) : mLastMatch(nullptr) {
+        mStr = str ? str : "";
+        mStrHash = computeHash(mStr);
+    }
+
+private:
+    static std::uint64_t computeHash(const std::string& str) {
+        if (str.empty()) return 0;
+        constexpr std::uint64_t kOffset = 0xCBF29CE484222325ULL;
+        constexpr std::uint64_t kPrime = 0x100000001B3ULL;
+        std::uint64_t hash = kOffset;
+        for (char ch : str) hash = static_cast<std::uint64_t>(static_cast<unsigned char>(ch)) ^ (kPrime * hash);
+        return hash;
+    }
+};
+
+struct MaterialPtr {
+    void* sharedPtrData[2]{nullptr, nullptr};
+
+    MaterialPtr() = default;
+    MaterialPtr(const MaterialPtr&) = delete;
+    MaterialPtr& operator=(const MaterialPtr&) = delete;
+    MaterialPtr(MaterialPtr&& other) noexcept
+        : sharedPtrData{other.sharedPtrData[0], other.sharedPtrData[1]} {
+        other.sharedPtrData[0] = nullptr;
+        other.sharedPtrData[1] = nullptr;
+    }
+    MaterialPtr& operator=(MaterialPtr&& other) noexcept {
+        if (this != &other) {
+            sharedPtrData[0] = other.sharedPtrData[0];
+            sharedPtrData[1] = other.sharedPtrData[1];
+            other.sharedPtrData[0] = nullptr;
+            other.sharedPtrData[1] = nullptr;
+        }
+        return *this;
+    }
+    ~MaterialPtr() {}
+    explicit operator bool() const { return sharedPtrData[0] != nullptr; }
+};
+
+std::uintptr_t resolveADRP(const std::uint32_t* insns, std::size_t count, std::uint32_t targetReg) {
+    for (std::size_t i = 0; i < count; i++) {
+        const std::uint32_t insn = insns[i];
+        if ((insn & 0x1F) != targetReg) continue;
+        if ((insn & 0x9F000000) == 0x90000000) {
+            const std::uintptr_t page =
+                (reinterpret_cast<std::uintptr_t>(&insns[i]) & ~0xFFFULL) +
+                static_cast<std::uintptr_t>(
+                    static_cast<std::int64_t>(
+                        static_cast<std::uint64_t>(((insn >> 3) & 0x1FFFFC) | ((insn >> 29) & 3)) << 43) >> 31);
+            for (std::size_t j = i + 1; j < count; j++) {
+                const std::uint32_t add = insns[j];
+                if ((add & 0xFF000000) == 0x91000000 && ((add >> 5) & 0x1F) == targetReg &&
+                    (add & 0x1F) == targetReg) {
+                    std::uint32_t imm12 = (add >> 10) & 0xFFF;
+                    if (add & 0x400000) imm12 <<= 12;
+                    return page + imm12;
+                }
+                if ((add & 0x1F) == targetReg) break;
             }
         }
     }
+    return 0;
 }
 
-void runDiscovery(std::uintptr_t levelRenderer, std::uintptr_t screenContext) {
+MaterialPtr g_material;
+const char* g_materialName = "none";
+bool g_materialTried = false;
+
+void acquireMaterial() {
+    if (g_materialTried) return;
+    g_materialTried = true;
+    if (!stageAllowed("material")) {
+        g_materialName = "skipped (crashed last time)";
+        return;
+    }
+    const auto rmg = bedrocktools::memory::resolve(SignatureId::RenderMaterialGroupCommon);
+    if (!rmg) {
+        g_materialName = "signature missing";
+        return;
+    }
+    armStage("material");
+    const auto groupAddr = resolveADRP(reinterpret_cast<const std::uint32_t*>(rmg), 2, 0);
+    std::uintptr_t group = groupAddr ? groupAddr + offsets::MaterialGroup::mRenderMaterialGroupOffset : 0;
+    if (!group || !isReadable(group, 8)) {
+        g_materialName = "group not readable";
+        disarmStage();
+        return;
+    }
+    const auto vtable = *reinterpret_cast<void***>(group);
+    if (!isReadable(reinterpret_cast<std::uintptr_t>(vtable), 8 * 8)) {
+        g_materialName = "vtable not readable";
+        disarmStage();
+        return;
+    }
+    void* fn = vtable[offsets::VTable::RenderMaterialGroup_getMaterial];
+    if (!fn || !isReadable(reinterpret_cast<std::uintptr_t>(fn), 4)) {
+        g_materialName = "getMaterial not readable";
+        disarmStage();
+        return;
+    }
+    using GetMaterialFn = MaterialPtr (*)(void*, const HashedString*);
+    static const char* kNames[] = {"selection_overlay", "selection_box"};
+    for (const char* name : kNames) {
+        HashedString hs(name);
+        MaterialPtr m = reinterpret_cast<GetMaterialFn>(fn)(reinterpret_cast<void*>(group), &hs);
+        if (m) {
+            g_material = std::move(m);
+            g_materialName = name;
+            break;
+        }
+    }
+    if (!g_material) g_materialName = "not found (null)";
+    disarmStage();
+}
+
+// ------------------------------------------------------------------ cizim
+
+using TessBeginFn = void (*)(void*, void*, int, int, int);
+using TessColorFn = void (*)(void*, float, float, float, float);
+using TessVertexFn = void (*)(void*, float, float, float);
+using RenderMeshFn = void (*)(void*, void*, void*, char*);
+
+TessBeginFn g_tessBegin = nullptr;
+TessColorFn g_tessColor = nullptr;
+TessVertexFn g_tessVertex = nullptr;
+RenderMeshFn g_renderMesh = nullptr;
+
+std::atomic<std::uint32_t> g_drawFrames{0};
+std::atomic<std::uint32_t> g_lastQuadCount{0};
+std::atomic<int> g_drawState{0};  // 0=hazir degil 1=cizdi 2=atlandi
+std::string g_drawNote;
+std::mutex g_noteMutex;
+
+void setNote(const std::string& note) {
+    std::lock_guard lock(g_noteMutex);
+    g_drawNote = note;
+}
+
+void resolveDrawFunctions() {
+    g_tessBegin = reinterpret_cast<TessBeginFn>(bedrocktools::memory::resolve(SignatureId::TessellatorBegin));
+    g_tessColor = reinterpret_cast<TessColorFn>(bedrocktools::memory::resolve(SignatureId::TessellatorColor));
+    if (g_base &&
+        std::memcmp(reinterpret_cast<const void*>(g_base + kVertexOffset), kVertexBytes.data(),
+                    kVertexBytes.size()) == 0) {
+        g_tessVertex = reinterpret_cast<TessVertexFn>(g_base + kVertexOffset);
+    }
+    auto rm = bedrocktools::memory::resolve(SignatureId::MeshHelpersRenderMeshImmediately2);
+    if (!rm) rm = bedrocktools::memory::resolve(SignatureId::MeshHelpersRenderMeshImmediately);
+    g_renderMesh = reinterpret_cast<RenderMeshFn>(rm);
+}
+
+// Her yuz 4 kose: 0 -> -eps, 1 -> 1+eps. Iki sarim yonu da cizilir (culling bilinmiyor).
+constexpr int kFaceCorners[6][4][3] = {
+    {{0, 0, 0}, {1, 0, 0}, {1, 0, 1}, {0, 0, 1}},  // alt
+    {{0, 1, 0}, {0, 1, 1}, {1, 1, 1}, {1, 1, 0}},  // ust
+    {{0, 0, 0}, {0, 1, 0}, {1, 1, 0}, {1, 0, 0}},  // kuzey
+    {{0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1}},  // guney
+    {{0, 0, 0}, {0, 0, 1}, {0, 1, 1}, {0, 1, 0}},  // bati
+    {{1, 0, 0}, {1, 1, 0}, {1, 1, 1}, {1, 0, 1}},  // dogu
+};
+
+bool drawSkyBlocks(void* screenContext, void* tess, const Vec3f& cam) {
     const auto blocks = copySkyPositions();
-    std::array<std::uintptr_t, 16> tess{};
-    for (std::size_t i = 0; i < tess.size(); ++i) tess[i] = g_renderTess[i].load();
+    if (blocks.empty()) return false;
 
-    std::string text;
-    char head[96];
-    text += "tessellators seen inside RenderLevel:";
-    for (const auto t : tess) {
-        if (!t) continue;
-        std::snprintf(head, sizeof head, " 0x%llx", static_cast<unsigned long long>(t));
-        text += head;
+    constexpr float kEps = 0.003f;
+    const float maxDist2 = g_params.maxDist * g_params.maxDist;
+
+    g_tessBegin(tess, nullptr, 1 /*QuadList*/, 0, 0);
+    g_tessColor(tess, g_params.r, g_params.g, g_params.b, 1.0f);
+
+    std::uint32_t quads = 0;
+    for (const auto& b : blocks) {
+        const float dx = static_cast<float>(b.x) + 0.5f - cam.x;
+        const float dy = static_cast<float>(b.y) + 0.5f - cam.y;
+        const float dz = static_cast<float>(b.z) + 0.5f - cam.z;
+        if (dx * dx + dy * dy + dz * dz > maxDist2) continue;
+
+        for (int f = 0; f < 6; ++f) {
+            float v[4][3];
+            for (int c = 0; c < 4; ++c) {
+                v[c][0] = static_cast<float>(b.x) + (kFaceCorners[f][c][0] ? 1.f + kEps : -kEps) - cam.x;
+                v[c][1] = static_cast<float>(b.y) + (kFaceCorners[f][c][1] ? 1.f + kEps : -kEps) - cam.y;
+                v[c][2] = static_cast<float>(b.z) + (kFaceCorners[f][c][2] ? 1.f + kEps : -kEps) - cam.z;
+            }
+            for (int c = 0; c < 4; ++c) g_tessVertex(tess, v[c][0], v[c][1], v[c][2]);
+            for (int c = 3; c >= 0; --c) g_tessVertex(tess, v[c][0], v[c][1], v[c][2]);
+            quads += 2;
+        }
     }
-    text += "\n";
-    markTessellatorOffsets(screenContext, "ScreenContext", tess, text);
-    markTessellatorOffsets(levelRenderer, "LevelRenderer", tess, text);
 
-    int found = 0;
-    if (!blocks.empty()) {
-        scanForCamera(levelRenderer, "LevelRenderer", blocks, text, found);
-        scanForCamera(screenContext, "ScreenContext", blocks, text, found);
-    } else {
-        text += "  (no sky blocks seen yet, camera scan skipped)\n";
-    }
-
-    std::lock_guard lock(g_scanMutex);
-    g_scanText = std::move(text);
+    char pad[0x58];
+    std::memset(pad, 0, sizeof(pad));
+    g_renderMesh(screenContext, tess, &g_material, pad);
+    g_lastQuadCount.store(quads, std::memory_order_relaxed);
+    return true;
 }
 
-// ------------------------------------------------- RenderLevel (sadece gozlem)
+void tryDraw(void* screenContext) {
+    if (!g_params.draw) {
+        setNote("draw=0 in sky_params.txt");
+        return;
+    }
+    if (!stageAllowed("draw")) {
+        setNote("skipped (crashed last time)");
+        g_drawState.store(2);
+        return;
+    }
+    const auto tess = g_renderTess.load();
+    if (!tess) return setNote("waiting: tessellator not captured yet");
+    if (!g_tessBegin || !g_tessColor || !g_tessVertex || !g_renderMesh)
+        return setNote("missing draw functions (begin/color/vertex/renderMesh)");
+    if (!g_material) return setNote("waiting: no material");
+    if (!isReadable(reinterpret_cast<std::uintptr_t>(screenContext), 0x40))
+        return setNote("screenContext not readable");
+
+    Vec3f pos;
+    if (!readPlayerPosition(pos)) return setNote("player position unreadable");
+    const Vec3f cam{pos.x, pos.y + g_params.eye, pos.z};
+
+    const bool first = g_drawState.load() == 0;
+    if (first) armStage("draw");
+    const bool drew = drawSkyBlocks(screenContext, reinterpret_cast<void*>(tess), cam);
+    if (first && drew) {
+        disarmStage();
+        g_drawState.store(1);
+    } else if (first) {
+        disarmStage();  // cizilecek blok yoktu, riskli cagri yapilmadi
+    }
+    if (drew) g_drawFrames.fetch_add(1, std::memory_order_relaxed);
+    setNote(drew ? "drawing" : "no sky blocks in range");
+}
+
+// ------------------------------------------------- RenderLevel
 
 // Tum tamsayi/float register'lari aynen iletilir; imza farkli olsa bile arguman kaybolmaz.
 using RenderLevelFn = void* (*)(void*, void*, void*, void*, void*, void*, void*, void*,
@@ -281,7 +565,7 @@ using RenderLevelFn = void* (*)(void*, void*, void*, void*, void*, void*, void*,
 RenderLevelFn g_renderLevelOriginal = nullptr;
 bedrocktools::hooks::Handle g_renderLevelHandle = nullptr;
 std::atomic<std::uint32_t> g_renderCalls{0};
-std::atomic<std::uintptr_t> g_arg0{0}, g_arg1{0}, g_arg2{0};
+std::atomic<std::uintptr_t> g_arg0{0}, g_arg1{0};
 
 void* renderLevelDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6,
                         void* a7, float f0, float f1, float f2, float f3) {
@@ -294,12 +578,10 @@ void* renderLevelDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* 
     const auto n = g_renderCalls.fetch_add(1, std::memory_order_relaxed);
     g_arg0.store(reinterpret_cast<std::uintptr_t>(a0), std::memory_order_relaxed);
     g_arg1.store(reinterpret_cast<std::uintptr_t>(a1), std::memory_order_relaxed);
-    g_arg2.store(reinterpret_cast<std::uintptr_t>(a2), std::memory_order_relaxed);
 
-    if (n % 600 == 300 && g_scanRuns < 6) {
-        ++g_scanRuns;
-        runDiscovery(reinterpret_cast<std::uintptr_t>(a0), reinterpret_cast<std::uintptr_t>(a1));
-    }
+    if (n % 120 == 0) loadParams();
+    if (n >= 120 && g_renderTess.load() != 0) acquireMaterial();
+    if (n >= 120) tryDraw(a1);
     return result;
 }
 
@@ -320,31 +602,38 @@ void writeReport() {
     std::ofstream out(g_dir / "sky_render.txt");
     if (!out) return;
 
-    bool vertexOk = false;
-    if (g_base) {
-        vertexOk = std::memcmp(reinterpret_cast<const void*>(g_base + kVertexOffset),
-                               kVertexBytes.data(), kVertexBytes.size()) == 0;
-    }
-    out << "vertex bytes at base+0x" << std::hex << kVertexOffset << std::dec << ": "
-        << (vertexOk ? "MATCH" : "MISMATCH") << "\n";
     out << "RenderLevel hook: " << (g_renderLevelHandle ? "yes" : "NO")
         << " calls=" << g_renderCalls.load() << "\n";
+    out << "vertex fn: " << (g_tessVertex ? "ok" : "MISSING") << ", begin: " << (g_tessBegin ? "ok" : "MISSING")
+        << ", color: " << (g_tessColor ? "ok" : "MISSING")
+        << ", renderMesh: " << (g_renderMesh ? "ok" : "MISSING") << "\n";
+    out << "tessellator (captured in RenderLevel): 0x" << std::hex << g_renderTess.load() << std::dec << "\n";
+    out << "RenderLevel args: 0x" << std::hex << g_arg0.load() << " 0x" << g_arg1.load() << std::dec << "\n";
+    out << "material: " << g_materialName << (g_material ? " (acquired)" : "") << "\n";
 
-    out << "begin hook: " << (g_beginHandle ? "yes" : "NO") << "\n";
-    out << "RenderLevel args: 0x" << std::hex << g_arg0.load() << " 0x" << g_arg1.load()
-        << " 0x" << g_arg2.load() << std::dec << "\n";
+    Vec3f pos;
+    const bool posOk = readPlayerPosition(pos);
+    out << "player ptr: 0x" << std::hex << g_player.load() << std::dec << "  position: ";
+    if (posOk) out << pos.x << ", " << pos.y << ", " << pos.z << "\n";
+    else out << "UNREADABLE\n" << scanPlayerForPosition();
+
+    out << "params: eye=" << g_params.eye << " draw=" << g_params.draw << " color=(" << g_params.r << ","
+        << g_params.g << "," << g_params.b << ") maxdist=" << g_params.maxDist << "\n";
     {
-        std::lock_guard scanLock(g_scanMutex);
-        out << "discovery runs: " << g_scanRuns << "\n" << g_scanText;
+        std::lock_guard lock(g_noteMutex);
+        out << "draw: " << g_drawNote << "  frames=" << g_drawFrames.load()
+            << " quads/frame=" << g_lastQuadCount.load() << "\n";
     }
+    out << "failed stages:";
+    for (const auto& s : g_failedStages) out << " " << s;
+    out << "\n";
 
-    std::lock_guard lock(g_posMutex);
-    out << "sky blocks seen: " << g_skyPositions.size() << "\n";
+    const auto blocks = copySkyPositions();
+    out << "sky blocks seen: " << blocks.size() << "\n";
     std::size_t shown = 0;
-    for (const auto& s : g_skyPositions) {
-        if (shown++ >= 16) break;
-        out << "  raw=(" << s.rx << ", " << s.ry << ", " << s.rz << ")  floor=("
-            << s.x << ", " << s.y << ", " << s.z << ")\n";
+    for (const auto& s : blocks) {
+        if (shown++ >= 12) break;
+        out << "  (" << s.x << ", " << s.y << ", " << s.z << ")\n";
     }
 }
 
@@ -360,6 +649,10 @@ void SkyModule::onInit() {
         g_base = reinterpret_cast<std::uintptr_t>(info.dli_fbase);
     }
 
+    loadStages();
+    loadParams();
+    resolveDrawFunctions();
+    installPlayerTracking();
     installFaceHooks();
     installBeginHook();
     installRenderLevelHook();
@@ -369,7 +662,7 @@ void SkyModule::onInit() {
 void SkyModule::onFrame() {
     static unsigned frame = 0;
     ++frame;
-    if (frame % 600 == 0) writeReport();
+    if (frame % 300 == 0) writeReport();
 }
 
 void SkyModule::onEnable() { g_active.store(true, std::memory_order_relaxed); }
