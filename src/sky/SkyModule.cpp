@@ -2,6 +2,7 @@
 
 #include "config/ConfigManager.hpp"
 #include "core/memory/Hooks.hpp"
+#include "GlTrace.hpp"
 #include <bedrocktools/events/EventBus.hpp>
 #include <bedrocktools/events/Events.hpp>
 #include <bedrocktools/memory/Signatures.hpp>
@@ -96,7 +97,7 @@ void loadStages() {
 }
 
 // Yeni derlemede eski basarisizliklar gecersiz olsun diye adimlar derleme etiketiyle saklanir.
-constexpr const char* kBuildTag = "r3:";
+constexpr const char* kBuildTag = "r4:";
 std::string tagged(const char* name) { return std::string(kBuildTag) + name; }
 
 bool stageAllowed(const char* name) { return g_failedStages.count(tagged(name)) == 0; }
@@ -447,24 +448,70 @@ void acquireMaterial() {
 using TessBeginFn = void (*)(void*, void*, int, int, int);
 using TessColorFn = void (*)(void*, float, float, float, float);
 using TessVertexFn = void (*)(void*, float, float, float);
-using RenderMeshFn = void (*)(void*, void*, void*, char*);
 
 TessBeginFn g_tessBegin = nullptr;
 TessColorFn g_tessColor = nullptr;
 TessVertexFn g_tessVertex = nullptr;
-std::array<RenderMeshFn, 2> g_renderMeshes{};
-constexpr const char* kRenderStages[2] = {"draw:render:0", "draw:render:1"};
 
-std::atomic<std::uint32_t> g_drawFrames{0};
-std::atomic<std::uint32_t> g_lastQuadCount{0};
-std::atomic<int> g_renderIdxUsed{-1};
-std::atomic<int> g_drawState{0};  // 0=hazir degil 1=cizdi 2=atlandi
-std::string g_drawNote;
-std::mutex g_noteMutex;
+// MeshHelpers::renderMeshImmediately: oyunun kendi cagrisinin argumanlarini yakalariz ve
+// ayni argumanlarla (ayni ScreenContext, tessellator, pad) kendi cizimimizi yaparız.
+using MeshFn = void* (*)(void*, void*, void*, void*, void*, void*, void*, void*,
+                         float, float, float, float);
+constexpr const char* kReplayStages[2] = {"draw:replay:0", "draw:replay:1"};
 
-void setNote(const std::string& note) {
-    std::lock_guard lock(g_noteMutex);
-    g_drawNote = note;
+std::array<MeshFn, 2> g_meshOriginal{};
+std::array<bedrocktools::hooks::Handle, 2> g_meshHandles{};
+std::array<std::atomic<std::uint32_t>, 2> g_meshCalls{};
+std::atomic<std::uint32_t> g_meshCallsThisFrame{0};
+std::atomic<std::uint32_t> g_meshCallsLastFrame{0};
+
+struct MeshCall {
+    bool valid = false;
+    int variant = -1;
+    std::uintptr_t ctx = 0, tess = 0, material = 0, padPtr = 0;
+    std::array<char, 0x100> pad{};
+};
+MeshCall g_lastMeshCall;  // sadece render thread'inde yazilir/okunur
+
+template <int I>
+void* meshDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7,
+                 float f0, float f1, float f2, float f3) {
+    void* result = g_meshOriginal[I] ? g_meshOriginal[I](a0, a1, a2, a3, a4, a5, a6, a7, f0, f1, f2, f3)
+                                     : nullptr;
+    g_meshCalls[I].fetch_add(1, std::memory_order_relaxed);
+    if (t_inRenderLevel) {
+        g_meshCallsThisFrame.fetch_add(1, std::memory_order_relaxed);
+        MeshCall& c = g_lastMeshCall;
+        c.valid = true;
+        c.variant = I;
+        c.ctx = reinterpret_cast<std::uintptr_t>(a0);
+        c.tess = reinterpret_cast<std::uintptr_t>(a1);
+        c.material = reinterpret_cast<std::uintptr_t>(a2);
+        c.padPtr = reinterpret_cast<std::uintptr_t>(a3);
+        if (isReadable(c.padPtr, c.pad.size())) {
+            std::memcpy(c.pad.data(), reinterpret_cast<const void*>(c.padPtr), c.pad.size());
+        } else {
+            c.pad.fill(0);
+        }
+    }
+    return result;
+}
+
+constexpr std::array<MeshFn, 2> kMeshDetours = {&meshDetour<0>, &meshDetour<1>};
+
+void installMeshHooks() {
+    const std::array<SignatureId, 2> ids = {SignatureId::MeshHelpersRenderMeshImmediately2,
+                                            SignatureId::MeshHelpersRenderMeshImmediately};
+    std::uintptr_t first = 0;
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const auto address = bedrocktools::memory::resolve(ids[i]);
+        if (!address || address == first) continue;
+        if (!first) first = address;
+        g_meshHandles[i] = bedrocktools::hooks::install(
+            reinterpret_cast<void*>(address),
+            reinterpret_cast<void*>(kMeshDetours[i]),
+            reinterpret_cast<void**>(&g_meshOriginal[i]));
+    }
 }
 
 void resolveDrawFunctions() {
@@ -475,10 +522,17 @@ void resolveDrawFunctions() {
                     kVertexBytes.size()) == 0) {
         g_tessVertex = reinterpret_cast<TessVertexFn>(g_base + kVertexOffset);
     }
-    g_renderMeshes[0] = reinterpret_cast<RenderMeshFn>(
-        bedrocktools::memory::resolve(SignatureId::MeshHelpersRenderMeshImmediately2));
-    g_renderMeshes[1] = reinterpret_cast<RenderMeshFn>(
-        bedrocktools::memory::resolve(SignatureId::MeshHelpersRenderMeshImmediately));
+}
+
+std::atomic<std::uint32_t> g_drawFrames{0};
+std::atomic<std::uint32_t> g_lastQuadCount{0};
+std::atomic<int> g_drawState{0};  // 0=henuz cizilmedi 1=cizdi
+std::string g_drawNote;
+std::mutex g_noteMutex;
+
+void setNote(const std::string& note) {
+    std::lock_guard lock(g_noteMutex);
+    g_drawNote = note;
 }
 
 // Her yuz 4 kose: 0 -> -eps, 1 -> 1+eps. Iki sarim yonu da cizilir (culling bilinmiyor).
@@ -491,10 +545,12 @@ constexpr int kFaceCorners[6][4][3] = {
     {{1, 0, 0}, {1, 1, 0}, {1, 1, 1}, {1, 0, 1}},  // dogu
 };
 
-bool drawSkyBlocks(void* screenContext, void* tess, const Vec3f& cam, bool first, int renderIdx) {
+bool drawSkyBlocks(const MeshCall& mc, const Vec3f& cam, bool first) {
     const auto blocks = copySkyPositions();
     if (blocks.empty()) return false;
 
+    void* ctx = reinterpret_cast<void*>(mc.ctx);
+    void* tess = reinterpret_cast<void*>(mc.tess);
     constexpr float kEps = 0.003f;
     const float maxDist2 = g_params.maxDist * g_params.maxDist;
 
@@ -532,52 +588,38 @@ bool drawSkyBlocks(void* screenContext, void* tess, const Vec3f& cam, bool first
 
     if (first) {
         disarmStage();
-        armStage(kRenderStages[renderIdx]);
+        armStage(kReplayStages[mc.variant]);
     }
-    char pad[0x58];
-    std::memset(pad, 0, sizeof(pad));
-    g_renderMeshes[renderIdx](screenContext, tess, &g_material, pad);
+    std::array<char, 0x100> pad = mc.pad;  // oyunun kendi pad'inin kopyasi
+    g_meshOriginal[mc.variant](ctx, tess, &g_material, pad.data(), nullptr, nullptr, nullptr, nullptr,
+                               0.f, 0.f, 0.f, 0.f);
     if (first) disarmStage();
     g_lastQuadCount.store(quads, std::memory_order_relaxed);
-    g_renderIdxUsed.store(renderIdx, std::memory_order_relaxed);
     return true;
 }
 
-void tryDraw(void* screenContext) {
-    if (!g_params.draw) {
-        setNote("draw=0 in sky_params.txt");
-        return;
-    }
-    if (!stageAllowed("draw:begin") || !stageAllowed("draw:color") || !stageAllowed("draw:vertex")) {
-        setNote("disabled: begin/color/vertex crashed before (see failed stages)");
-        return;
-    }
-    int renderIdx = -1;
-    for (int i = 0; i < 2; ++i) {
-        if (g_renderMeshes[i] && stageAllowed(kRenderStages[i])) {
-            renderIdx = i;
-            break;
-        }
-    }
-    if (renderIdx < 0) {
-        setNote("disabled: no usable renderMesh (missing or crashed before)");
-        return;
-    }
-    const auto tess = g_renderTess.load();
-    if (!tess) return setNote("waiting: tessellator not captured yet");
+void tryDraw() {
+    if (!g_params.draw) return setNote("draw=0 in sky_params.txt");
+    if (!stageAllowed("draw:begin") || !stageAllowed("draw:color") || !stageAllowed("draw:vertex"))
+        return setNote("disabled: begin/color/vertex crashed before (see failed stages)");
     if (!g_tessBegin || !g_tessColor || !g_tessVertex)
         return setNote("missing draw functions (begin/color/vertex)");
     if (!g_material) return setNote("waiting: no material");
-    if (!isReadable(tess, 0x100)) return setNote("tessellator not readable");
-    if (!isReadable(reinterpret_cast<std::uintptr_t>(screenContext), 0x40))
-        return setNote("screenContext not readable");
+
+    const MeshCall mc = g_lastMeshCall;
+    if (!mc.valid || mc.variant < 0 || !g_meshOriginal[mc.variant])
+        return setNote("waiting: no renderMesh call seen inside RenderLevel");
+    if (!stageAllowed(kReplayStages[mc.variant]))
+        return setNote("disabled: replay render crashed before (see failed stages)");
+    if (!isReadable(mc.tess, 0x100) || !isReadable(mc.ctx, 0x40))
+        return setNote("captured tessellator/screenContext not readable");
 
     Vec3f pos;
     if (!readPlayerPosition(pos)) return setNote("player position unreadable");
     const Vec3f cam{pos.x, pos.y + g_params.eye, pos.z};
 
     const bool first = g_drawState.load() == 0;
-    const bool drew = drawSkyBlocks(screenContext, reinterpret_cast<void*>(tess), cam, first, renderIdx);
+    const bool drew = drawSkyBlocks(mc, cam, first);
     if (first && drew) g_drawState.store(1);
     if (drew) g_drawFrames.fetch_add(1, std::memory_order_relaxed);
     setNote(drew ? "drawing" : "no sky blocks in range");
@@ -596,19 +638,24 @@ std::atomic<std::uintptr_t> g_arg0{0}, g_arg1{0};
 
 void* renderLevelDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6,
                         void* a7, float f0, float f1, float f2, float f3) {
+    g_lastMeshCall.valid = false;
+    g_meshCallsThisFrame.store(0, std::memory_order_relaxed);
     t_inRenderLevel = true;
+    skygl::markRenderLevel(true);
     void* result = g_renderLevelOriginal
                        ? g_renderLevelOriginal(a0, a1, a2, a3, a4, a5, a6, a7, f0, f1, f2, f3)
                        : nullptr;
     t_inRenderLevel = false;
+    skygl::markRenderLevel(false);
 
     const auto n = g_renderCalls.fetch_add(1, std::memory_order_relaxed);
     g_arg0.store(reinterpret_cast<std::uintptr_t>(a0), std::memory_order_relaxed);
     g_arg1.store(reinterpret_cast<std::uintptr_t>(a1), std::memory_order_relaxed);
 
+    g_meshCallsLastFrame.store(g_meshCallsThisFrame.load(std::memory_order_relaxed), std::memory_order_relaxed);
     if (n % 120 == 0) loadParams();
     if (n >= 120 && g_renderTess.load() != 0) acquireMaterial();
-    if (n >= 120) tryDraw(a1);
+    if (n >= 120) tryDraw();
     return result;
 }
 
@@ -632,10 +679,16 @@ void writeReport() {
     out << "RenderLevel hook: " << (g_renderLevelHandle ? "yes" : "NO")
         << " calls=" << g_renderCalls.load() << "\n";
     out << "vertex fn: " << (g_tessVertex ? "ok" : "MISSING") << ", begin: " << (g_tessBegin ? "ok" : "MISSING")
-        << ", color: " << (g_tessColor ? "ok" : "MISSING")
-        << ", renderMesh[0]: " << (g_renderMeshes[0] ? "ok" : "MISSING")
-        << ", renderMesh[1]: " << (g_renderMeshes[1] ? "ok" : "MISSING")
-        << ", used: " << g_renderIdxUsed.load() << "\n";
+        << ", color: " << (g_tessColor ? "ok" : "MISSING") << "\n";
+    out << "renderMesh hooks: [0]=" << (g_meshHandles[0] ? "yes" : "no") << " calls=" << g_meshCalls[0].load()
+        << "  [1]=" << (g_meshHandles[1] ? "yes" : "no") << " calls=" << g_meshCalls[1].load()
+        << "  inside RenderLevel last frame=" << g_meshCallsLastFrame.load() << "\n";
+    {
+        const MeshCall mc = g_lastMeshCall;
+        out << "last captured call: valid=" << mc.valid << " variant=" << mc.variant << std::hex << " ctx=0x"
+            << mc.ctx << " tess=0x" << mc.tess << " material=0x" << mc.material << " pad=0x" << mc.padPtr
+            << std::dec << "\n";
+    }
     out << "tessellator (captured in RenderLevel): 0x" << std::hex << g_renderTess.load() << std::dec << "\n";
     out << "RenderLevel args: 0x" << std::hex << g_arg0.load() << " 0x" << g_arg1.load() << std::dec << "\n";
     out << "material: " << g_materialName << (g_material ? " (acquired)" : "") << "\n";
@@ -680,10 +733,12 @@ void SkyModule::onInit() {
 
     loadStages();
     loadParams();
+    skygl::init(g_dir);
     resolveDrawFunctions();
     installPlayerTracking();
     installFaceHooks();
     installBeginHook();
+    installMeshHooks();
     installRenderLevelHook();
     setMasterEnabled(true);
 }
